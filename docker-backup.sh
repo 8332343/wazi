@@ -9,28 +9,28 @@ BACKUP_DIR="/tmp/docker-backup-$(date +%Y%m%d-%H%M%S)"
 mkdir -p "$BACKUP_DIR"
 echo "备份目录: $BACKUP_DIR"
 
-# 1. 分批备份所有Docker镜像（修复参数过长问题）
-echo "正在分批备份Docker镜像..."
+# 1. 备份所有Docker镜像（使用临时文件避免参数过长）
+echo "正在备份Docker镜像..."
 IMAGE_FILE="$BACKUP_DIR/image-list.txt"
 docker images --format "{{.ID}}" | sort -u > "$IMAGE_FILE"
 
-total_images=$(wc -l < "$IMAGE_FILE")
-batch_size=50
-batches=$(( (total_images + batch_size - 1) / batch_size ))
-
-for ((i=0; i<batches; i++)); do
-    start=$((i * batch_size + 1))
-    end=$((start + batch_size - 1))
+if [ -s "$IMAGE_FILE" ]; then
+    echo "发现 $(wc -l < "$IMAGE_FILE") 个镜像，开始分批备份..."
     
-    echo "备份镜像批次 $((i+1))/$batches ($start-$end)"
-    batch_ids=$(sed -n "${start},${end}p" "$IMAGE_FILE" | tr '\n' ' ')
+    # 分批处理镜像（每批10个）
+    split -l 10 "$IMAGE_FILE" "$BACKUP_DIR/image-batch-"
     
-    if [ -n "$batch_ids" ]; then
-        docker save $batch_ids -o "$BACKUP_DIR/images-batch-$((i+1)).tar"
-    fi
-done
+    find "$BACKUP_DIR" -name 'image-batch-*' | while read batch_file; do
+        echo "处理批次: $(basename "$batch_file")"
+        batch_images=$(tr '\n' ' ' < "$batch_file")
+        docker save $batch_images -o "$BACKUP_DIR/images-$(basename "$batch_file").tar"
+        rm "$batch_file"
+    done
+else
+    echo "没有发现镜像，跳过镜像备份"
+fi
 
-# 2. 备份所有容器配置
+# 2. 备份所有容器配置（使用目录避免长列表）
 echo "正在备份容器配置..."
 mkdir -p "$BACKUP_DIR/containers"
 docker ps -a --format '{{.Names}}' | while read container; do
@@ -38,7 +38,7 @@ docker ps -a --format '{{.Names}}' | while read container; do
     docker inspect "$container" > "$BACKUP_DIR/containers/${container}-config.json"
 done
 
-# 3. 备份所有数据卷
+# 3. 备份所有数据卷（逐卷处理）
 echo "正在备份Docker卷..."
 mkdir -p "$BACKUP_DIR/volumes"
 docker volume ls -q | while read volume; do
@@ -55,7 +55,7 @@ docker network ls --format '{{.Name}}' | grep -v 'bridge\|host\|none' | while re
     docker network inspect "$network" > "$BACKUP_DIR/networks/network-${network}.json"
 done
 
-# 5. 创建恢复脚本
+# 5. 创建恢复脚本（避免长参数列表）
 cat > "$BACKUP_DIR/restore.sh" << 'EOF'
 #!/bin/bash
 # Docker容器一键恢复脚本
@@ -70,7 +70,7 @@ BACKUP_DIR="$1"
 # 1. 恢复所有镜像
 if [ -d "$BACKUP_DIR" ]; then
     echo "正在恢复Docker镜像..."
-    find "$BACKUP_DIR" -name 'images-batch-*.tar' | while read image_file; do
+    find "$BACKUP_DIR" -name 'images-image-batch-*.tar' | while read image_file; do
         echo "加载镜像文件: $(basename "$image_file")"
         docker load -i "$image_file"
     done
@@ -94,10 +94,15 @@ if [ -d "$BACKUP_DIR/containers" ]; then
     find "$BACKUP_DIR/containers" -name '*-config.json' | while read config_file; do
         container_name=$(basename "$config_file" "-config.json")
         echo "恢复容器: $container_name"
+        
+        # 从配置文件中提取信息
         image_name=$(jq -r '.[0].Config.Image' "$config_file")
         restart_policy=$(jq -r '.[0].HostConfig.RestartPolicy.Name' "$config_file")
         
+        # 创建容器
         docker create --name "$container_name" "$image_name" >/dev/null
+        
+        # 设置重启策略
         docker update --restart "$restart_policy" "$container_name"
     done
 fi
